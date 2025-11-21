@@ -97,30 +97,16 @@ endif()
 
 # ---- espeak-ng ---
 
+# Require local espeak-ng submodule. Do not download or fallback to the
+# older archive; fail if it's missing. If you intend to use a prebuilt
+# espeak-ng install, set ESPEAK_NG_DIR accordingly.
 if(NOT DEFINED ESPEAK_NG_DIR)
-    set(ESPEAK_NG_DIR "${CMAKE_CURRENT_BINARY_DIR}/ei")
-
-    include(ExternalProject)
-    ExternalProject_Add(
-        espeak_ng_external
-        PREFIX "${CMAKE_CURRENT_BINARY_DIR}/e"
-        URL "https://github.com/rhasspy/espeak-ng/archive/0f65aa301e0d6bae5e172cc74197d32a6182200f.zip"
-        CMAKE_ARGS -DCMAKE_INSTALL_PREFIX:PATH=${ESPEAK_NG_DIR}
-        CMAKE_ARGS -DUSE_ASYNC:BOOL=OFF
-        CMAKE_ARGS -DBUILD_SHARED_LIBS:BOOL=OFF
-        CMAKE_ARGS -DUSE_MBROLA:BOOL=OFF
-        CMAKE_ARGS -DUSE_LIBSONIC:BOOL=OFF
-        CMAKE_ARGS -DUSE_LIBPCAUDIO:BOOL=OFF
-        CMAKE_ARGS -DUSE_KLATT:BOOL=OFF
-        CMAKE_ARGS -DUSE_SPEECHPLAYER:BOOL=OFF
-        CMAKE_ARGS -DEXTRA_cmn:BOOL=ON
-        CMAKE_ARGS -DEXTRA_ru:BOOL=ON
-        CMAKE_ARGS -DCMAKE_C_FLAGS_RELEASE="/MT /O2 /Ob2 /DNDEBUG /D_FILE_OFFSET_BITS=64"
-        CMAKE_ARGS -DCMAKE_C_FLAGS_DEBUG="/MTd /Zi /Ob0 /Od /RTC1 /D_FILE_OFFSET_BITS=64"
-        CMAKE_ARGS -DCMAKE_CXX_FLAGS_RELEASE="/MT /O2 /Ob2 /DNDEBUG"
-        CMAKE_ARGS -DCMAKE_CXX_FLAGS_DEBUG="/MTd /Zi /Ob0 /Od /RTC1"
-    )
-    add_dependencies(piper_phonemize espeak_ng_external)
+    if(EXISTS "${PROJECT_SOURCE_DIR}/external/espeak-ng/CMakeLists.txt")
+        set(ESPEAK_NG_DIR "${PROJECT_SOURCE_DIR}/external/espeak-ng/src")
+        add_subdirectory(${PROJECT_SOURCE_DIR}/external/espeak-ng ${CMAKE_CURRENT_BINARY_DIR}/external_espeak_ng_build)
+    else()
+        message(FATAL_ERROR "espeak-ng submodule not found. Initialize the submodule or set -DESPEAK_NG_DIR to the install directory of espeak-ng.")
+    endif()
 endif()
 
 
@@ -139,8 +125,67 @@ target_link_directories(
     ${ONNXRUNTIME_DIR}/lib
 )
 
+# ensure linker finds external espeak-ng internal libraries (ucd) - Release paths
+link_directories(${CMAKE_CURRENT_BINARY_DIR}/external_espeak_ng_build/src/ucd-tools/Release)
+
+if(TARGET espeak-ng)
+    if(MSVC)
+        # Silence CRT deprecation warnings for in-tree espeak-ng builds
+        target_compile_definitions(espeak-ng PRIVATE _CRT_SECURE_NO_WARNINGS)
+    endif()
+    # Ensure consumers see the same export macro (propagate to INTERFACE)
+    target_compile_definitions(espeak-ng INTERFACE LIBESPEAK_NG_EXPORT=1)
+    if(TARGET ucd)
+        # If espeak-ng is built in-tree and the ucd target exists, link it publicly
+        # so that the dependency propagates to executables that link piper_phonemize.
+        target_link_libraries(piper_phonemize PUBLIC ucd)
+    endif()
+    # ensure link path finds espeak-ng internal sibling libraries (ucd, etc.)
+    target_link_directories(piper_phonemize PUBLIC
+        "$<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/external_espeak_ng_build/src/ucd-tools/Release>"
+        "$<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/external_espeak_ng_build/src/ucd-tools/Debug>"
+        "$<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/external_espeak_ng_build/src/ucd-tools/Release>"
+        "$<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/external_espeak_ng_build/src/ucd-tools/Debug>"
+        )
+endif()
+
+if(NOT TARGET espeak-ng)
+    # If espeak-ng was not built in-tree (e.g., using an external install),
+    # the espeak-ng INTERFACE compile definition may be unavailable; define
+    # the export macro so headers don't default to __declspec(dllimport).
+    target_compile_definitions(piper_phonemize PUBLIC LIBESPEAK_NG_EXPORT=1)
+endif()
+
+if(WIN32 AND TARGET espeak-ng)
+    # try to find ucd.lib built by espeak-ng in build tree and add if found
+    find_library(UCD_LIB_RELEASE NAMES ucd
+        PATHS "${CMAKE_CURRENT_BINARY_DIR}/external_espeak_ng_build/src/ucd-tools/Release"
+        NO_DEFAULT_PATH)
+    find_library(UCD_LIB_DEBUG NAMES ucd
+        PATHS "${CMAKE_CURRENT_BINARY_DIR}/external_espeak_ng_build/src/ucd-tools/Debug"
+        NO_DEFAULT_PATH)
+    # no alt external download paths supported
+
+    # If find_library didn't work at configure time, try linking directly to expected build paths
+    if(UCD_LIB_RELEASE)
+        target_link_libraries(piper_phonemize PUBLIC ${UCD_LIB_RELEASE})
+    elseif(UCD_LIB_DEBUG)
+        target_link_libraries(piper_phonemize PUBLIC ${UCD_LIB_DEBUG})
+    else()
+        message(WARNING "ucd lib not found by find_library; attempting path-based linking to ucd.lib in espeak-ng build directories")
+        # try generator-expressions for config-specific paths
+        target_link_libraries(piper_phonemize PUBLIC
+            $<IF:$<CONFIG:Debug>,${CMAKE_CURRENT_BINARY_DIR}/external_espeak_ng_build/src/ucd-tools/Debug/ucd.lib,${CMAKE_CURRENT_BINARY_DIR}/external_espeak_ng_build/src/ucd-tools/Release/ucd.lib>
+            $<IF:$<CONFIG:Debug>,${CMAKE_CURRENT_BINARY_DIR}/external_espeak_ng_build/src/ucd-tools/Debug/ucd.lib,${CMAKE_CURRENT_BINARY_DIR}/external_espeak_ng_build/src/ucd-tools/Release/ucd.lib>)
+    endif()
+endif()
+
+if(WIN32 AND NOT TARGET espeak-ng)
+    message(FATAL_ERROR "espeak-ng is not configured as an in-tree target; please initialize `external/espeak-ng` submodule and re-run CMake or set -DESPEAK_NG_DIR to a valid install.")
+endif()
+
 target_link_libraries(
-    piper_phonemize
+    piper_phonemize PUBLIC
     espeak-ng
     onnxruntime
 )
@@ -172,6 +217,20 @@ target_link_libraries(piper_phonemize_exe PUBLIC
     piper_phonemize
     espeak-ng
 )
+
+if(TARGET ucd)
+    # If espeak-ng is built in-tree and ucd target exists, ensure the exe links ucd
+    target_link_libraries(piper_phonemize_exe PRIVATE ucd)
+endif()
+
+if(TARGET espeak-ng)
+    target_link_directories(piper_phonemize_exe PUBLIC
+        "$<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/external_espeak_ng_build/src/ucd-tools/Release>"
+        "$<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/external_espeak_ng_build/src/ucd-tools/Debug>"
+        "$<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/external_espeak_ng_build/src/ucd-tools/Release>"
+        "$<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/external_espeak_ng_build/src/ucd-tools/Debug>"
+        )
+endif()
 
 # ---- Declare test ----
 
